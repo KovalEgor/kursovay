@@ -1,0 +1,283 @@
+#бот создан для встраивания в сообщества "ВКонтакте".
+#тема курсовой - Создание бота-помощника для публичного сообщества в социальной сети «ВКонтакте»
+#Создано Ковалем Егором / 09.03.02 / ИСиТ / ФМФ
+# Импорт библиотек
+import vk_api
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+import random
+import sqlite3
+import datetime
+# Получение API ключа и установка административных настроек
+token = "токен"
+group_id = "идентификатор группы"
+admin_password = "пароль"
+admin_id = 'идентификатор администратора'
+# Подключение к локальной базе данных
+conn = sqlite3.connect('database.db')
+cursor = conn.cursor()
+# Создание таблиц в базе данных, если базы данных нет, то она создатся автоматически и заполнится таблицами.
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        surname TEXT,
+        phone_number TEXT,
+        time_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS registration_activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE,
+        last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        attempt_count INTEGER DEFAULT 0
+    )
+''')
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS banned_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE
+    )
+''')
+# Проверка наличия таблицы registration_activity
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='registration_activity'")
+if not cursor.fetchone():
+    print("Таблица registration_activity не существует. Создайте ее.")
+else:
+    print("Таблица registration_activity существует.")
+# Авторизация бота
+vk_session = vk_api.VkApi(token=token)
+vk = vk_session.get_api()
+longpoll = VkBotLongPoll(vk_session, group_id)
+# Функции бота. Эта функция используется для от-правки сообщений через VK (ВКон-такте) API.
+def send_message(user_id, message, keyboard=None):
+    vk.messages.send(
+        user_id=int(user_id),
+        message=message,
+        random_id=random.randint(1, 2**31 - 1),
+        keyboard=keyboard
+    )
+#Функция предназначена для обновления активности регистрации пользователя в базе данных SQLite. 
+#Использоваться для отслеживания активности и попыток регистрации пользователей в системе.
+def update_registration_activity(user_id):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO registration_activity (user_id) 
+            VALUES (?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET last_attempt = CURRENT_TIMESTAMP, attempt_count = attempt_count + 1
+        ''', (user_id,))
+        conn.commit()
+#Функция используется для провер-ки, является ли регистрация пользо-вателя в системе частой, основываясь на данных, хранящихся в базе данных SQLite.
+def is_registration_frequent(user_id, interval_minutes=5, max_attempts=3):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM registration_activity 
+            WHERE user_id = ? AND 
+                  last_attempt > datetime('now', '-{0} minutes')
+        '''.format(interval_minutes), (user_id,))
+        attempt_count = cursor.fetchone()[0]
+        return attempt_count >= max_attempts
+#Функция (в разработке), основывается на имеющихся запрещенных словах из файла, заносит пользователя в черный список
+def load_banned_words():
+    with open('banned_words.txt', 'r', encoding='utf-8') as file:
+        banned_words = [line.strip().lower() for line in file]
+    return banned_words
+#загрузка текстового файла
+banned_words = load_banned_words()
+#Функция (в разработке)
+def check_for_banned_words(message):
+    return any(banned_word in message for banned_word in banned_words)
+#Функция используется для блокировки пользователя в чате. Она отправляет пользователю сообщение о том, что он был заблокирован за использование недопустимых слов или нарушение правил.
+def ban_user(user_id, message):
+        if check_for_banned_words(message):
+            send_message(user_id, "Вы были заблокированы за использование недопустимых слов.")
+        return
+#Функция предназначена для блокировки пользователя в группе или сообществе путем добавления его идентификатора в таблицу banned_users в базе данных SQLite.
+def ban_user_in_group(user_id):
+    try:
+        with sqlite3.connect('database.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (user_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"Ошибка при записи бана пользователя: {e}")
+#Функция предназначена для проверки, заблокирован ли пользователь с заданным user_id в группе или сообществе.
+def is_user_banned(user_id):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM banned_users WHERE user_id = ?', (user_id,))
+        return cursor.fetchone() is not None
+#Функция add_to_banned выполняет две основные задачи: 
+#1.Добавление пользователя в список заблокированных (banned_users) в базе данных SQLite.
+#2.Отправка уведомления администратору о добавлении пользователя в список заблокированных.
+def add_to_banned(banned_user_id):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)', (banned_user_id,))
+        conn.commit()
+    send_message(admin_id, f"Пользователь {banned_user_id} добавлен в список заблокированных")
+#Функция remove_from_banned выполняет две основные задачи:
+#1.Удаление пользователя из списка заблокированных (banned_users) в базе данных SQLite.
+#2.Отправка уведомления администратору о удалении пользователя из списка заблокированных.
+def remove_from_banned(banned_user_id):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (banned_user_id,))
+        conn.commit()
+    send_message(admin_id, f"Пользователь {banned_user_id} удален из списка заблокированных")
+#Функция используется для создания виртуальной клавиатуры для пользователя, который работает с ботом «ВКонтакте».
+def create_keyboard():
+    keyboard = VkKeyboard(one_time=True)
+    keyboard.add_button("Записаться", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_line()
+    keyboard.add_button("admin", color=VkKeyboardColor.NEGATIVE)
+    keyboard.add_button("Отмена", color=VkKeyboardColor.NEGATIVE)
+    return keyboard.get_keyboard()
+#Функция используется для создания виртуальной клавиатуры для администратора, который работает с ботом «ВКонтакте».
+def create_admin_keyboard():
+    keyboard = VkKeyboard(one_time=True)
+    keyboard.add_button("Добавить в заблокированные", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button("Удалить из заблокированных", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button("Вернуться", color=VkKeyboardColor.NEGATIVE)
+    return keyboard.get_keyboard()
+#Функция используется для проверки администраторского пароля, предоставленного пользователем.
+def check_admin_password(user_id, password):
+    if password == admin_password:
+        send_message(user_id, "Доступ разрешен", create_admin_keyboard())
+        user_states[user_id] = {'state': 'admin_mode'}  # Устанавливаем состояние администратора
+        return True
+    else:
+        send_message(user_id, "Неверный пароль")
+        return False
+# Основной цикл обработки сообщений
+user_states = {}
+banned_users_cache = set()
+print("Бот запущен")
+#Эта функция предназначена для обновления активности пользователя в таблице registration_activity базы данных SQLite.
+def update_user_activity(user_id):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO registration_activity (user_id) 
+            VALUES (?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET last_attempt = CURRENT_TIMESTAMP, attempt_count = attempt_count + 1
+        ''', (user_id,))
+        conn.commit()
+#Функция служит для определения, является ли активность пользователя (в данном случае количество попыток выполнения каких-либо дей-ствий) чрезмерно частой в течение заданного времени.
+def is_user_activity_frequent(user_id, interval_minutes=5, max_attempts=9):
+    with sqlite3.connect('database.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM registration_activity 
+            WHERE user_id = ? AND 
+                  last_attempt > datetime('now', '-{0} minutes')
+        '''.format(interval_minutes), (user_id,))
+        attempt_count = cursor.fetchone()[0]
+        return attempt_count >= max_attempts
+# Основной цикл обработки сообщений
+while True:
+    for event in longpoll.listen():
+        if event.type == VkBotEventType.MESSAGE_NEW:
+            user_id = event.obj.message['from_id']
+            message = event.obj.message['text'].lower()
+# Проверяем, не заблокирован ли пользователь
+            if is_user_banned(user_id):
+                continue  # Пропускаем обработку сообщений от заблокированных пользователей
+# Проверка состояния пользователя
+            if user_id in user_states:
+                if user_states[user_id].get('state') == 'waiting_for_password':
+                    if check_admin_password(user_id, message):
+                        continue
+                    else:
+                        del user_states[user_id]  # Удаляем состояние, если пароль неверный
+                        continue
+# Обработка команд администратора
+                elif user_states[user_id].get('state') == 'admin_mode':
+                    if message.startswith("добавить в заблокированные "):
+                        parts = message.split()
+                        if len(parts) >= 4 and parts[3].isdigit():
+                            banned_user_id = parts[3]
+                            add_to_banned(banned_user_id)
+                            banned_users_cache.add(banned_user_id)  # Обновляем кэш
+                        else:
+                            send_message(user_id, "Неправильный формат команды. Укажите ID пользователя.")
+                        continue
+                    elif message.startswith("удалить из заблокированных"):
+                        try:
+                            banned_user_id = message.split(" ")[3]
+                            remove_from_banned(banned_user_id)
+                            send_message(user_id, f"Пользователь {banned_user_id} удален из списка заблокированных", create_keyboard())
+                        except IndexError:
+                            send_message(user_id, "Неправильный формат команды. Укажите ID пользователя.")
+                            continue
+                    elif message == "вернуться":
+                        send_message(user_id, "Вы вернулись в главное меню", create_keyboard())
+                        del user_states[user_id]  # Удаляем состояние администратора
+                        continue
+# Обработка команды "admin"
+            if user_id == admin_id and message == "admin":
+                send_message(user_id, "Пожалуйста, введите админ-пароль:")
+                user_states[user_id] = {'state': 'waiting_for_password'}
+                continue
+            update_user_activity(user_id)
+            if is_user_activity_frequent(user_id):
+                ban_user_in_group(user_id)
+                ban_user(user_id)
+                continue
+            if message in ["записаться", "Записаться", "ЗАПИСАТЬСЯ", "зАПИСАТЬСЯ"]:
+                update_registration_activity(user_id)
+                if is_registration_frequent(user_id):
+                    ban_user_in_group(user_id)
+                    ban_user(user_id)
+                    send_message(user_id, "Вы временно заблокированы от регистрации из-за частых попыток.")
+                    continue
+                send_message(user_id, "Отлично! Пожалуйста, напиши свое имя:")
+                user_states[user_id] = {'state': 'waiting_for_name'}
+                continue
+            if user_states.get(user_id, {}).get('state') == "waiting_for_name":
+                user_states[user_id] = {'name': message, 'state': 'waiting_for_surname'}
+                send_message(user_id, "Пожалуйста, напиши свою фамилию:")
+                continue
+            if user_states.get(user_id, {}).get('state') == "waiting_for_surname":
+                user_states[user_id].update({'surname': message, 'state': 'waiting_for_phone'})
+                send_message(user_id, "Теперь напиши свой телефон для записи:")
+                continue
+            if user_states.get(user_id, {}).get('state') == "waiting_for_phone":
+                phone_number = message
+                name = user_states[user_id].get('name', '')
+                surname = user_states[user_id].get('surname', '')
+                time_added = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    with sqlite3.connect('database.db') as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('INSERT INTO users (user_id, name, surname, phone_number, time_added) VALUES (?, ?, ?, ?, ?)', (user_id, name, surname, phone_number, time_added))
+                        conn.commit()
+                    send_message(user_id, f"Спасибо, {name}! Твой телефон {phone_number} успешно записан.")
+                    send_message(admin_id, f"Новая запись: {name} {surname}, телефон: {phone_number}, время: {time_added}")
+                except Exception as e:
+                    send_message(user_id, f"Произошла ошибка: {e}")
+                del user_states[user_id]
+                continue
+# Обработка команд
+            if message in ["начать", "привет", "Начать", "Привет", "НАЧАТЬ", "ПРИВЕТ", "нАЧАТЬ", "пРИВЕТ"]:
+                send_message(user_id, "Привет! На связи Бот ДИНАМО! Для записи на мероприятие нажмите на 'Записаться'", create_keyboard())
+            elif message in ["admin"]:
+                send_message(user_id, "Отлично! Пожалуйста, напиши админ-пароль:")
+                user_states[user_id] = {'state': 'waiting_for_password'}
+            elif message in ["записаться", "Записаться", "ЗАПИСАТЬСЯ", "зАПИСАТЬСЯ",]:
+                send_message(user_id, "Отлично! Пожалуйста, напиши свое имя:")
+                user_states[user_id] = {'state': 'waiting_for_name'}
+            elif message in ["отмена", "Отмена", "ОТМЕНА", "оТМЕНА"]:
+                send_message(user_id, "Операция отменена, для работы бота напишите начать")
+                if user_id in user_states:
+                    del user_states[user_id]
+            else:
+                send_message(user_id, "Прости, я тебя не понимаю. Попробуй воспользоваться кнопочной формой", create_keyboard())
+                update_user_activity(user_id)
